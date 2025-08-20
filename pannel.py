@@ -65,7 +65,7 @@ PRODUCT_SHORT_NAMES = {
 }
 
 # UPI details
-UPI_ID = "xyz@upi"  # Replace with actual UPI ID
+UPI_ID = "ninjagamerop0786@ybl"  # Replace with actual UPI ID
 
 # Conversation states
 SELECT_PRODUCT, SELECT_PLAN, PAYMENT_PROOF = range(3)
@@ -291,7 +291,7 @@ async def plan_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     # Send QR code image
     try:
-        with open("qr.png", "rb") as qr_file:
+        with open("qr.jpg", "rb") as qr_file:
             await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=InputFile(qr_file)
