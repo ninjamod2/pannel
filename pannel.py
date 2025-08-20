@@ -1,551 +1,823 @@
 import os
-from uuid import uuid4
+import logging
+import uuid
+import asyncio
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
-from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler,
 )
 
-from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, ForeignKey, Boolean, Text
+import asyncpg
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session, relationship
-from sqlalchemy import Enum as SAEnum
-from enum import Enum
+logger = logging.getLogger(__name__)
 
-# ========= ENV & CONFIG =========
-TOKEN = os.getenv("8073518014:AAF90nA5ns0pI307RvyHysXHJa8aLjk1CaA")
-ADMIN_IDS = {int(x) for x in os.getenv("1240179115", "6662804820").split(",") if x}
-UPI_ID = os.getenv("UPI_ID", "ninjagamerop0786@ybl")
-QR_PATH = os.getenv("QR_PATH", "assets/qr.jpg")  # put your QR image here
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT", "26257")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+ADMIN_IDS = [int(admin_id) for admin_id in os.getenv("ADMIN_IDS", "").split(",") if admin_id]
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN missing in env")
-
-Base = declarative_base()
-engine = create_engine("sqlite:///bot.db", echo=False, future=True)
-SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
-
-# ========= MODELS =========
-class OrderStatus(str, Enum):
-    pending = "pending"               # plan selected
-    awaiting_approval = "awaiting_approval"  # user clicked "I've paid"
-    paid = "paid"
-    cancelled = "cancelled"
-
-class KeyStatus(str, Enum):
-    unassigned = "unassigned"
-    assigned = "assigned"
-    expired = "expired"
-    revoked = "revoked"
-
-class User(Base):
-    __tablename__ = "users"
-    tg_user_id = Column(Integer, primary_key=True)
-    username = Column(String, nullable=True)
-    is_admin = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Product(Base):
-    __tablename__ = "products"
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    description = Column(Text, nullable=True)
-
-class Plan(Base):
-    __tablename__ = "plans"
-    id = Column(Integer, primary_key=True)
-    product_id = Column(Integer, ForeignKey("products.id"))
-    days = Column(Integer, nullable=False)
-    price_inr = Column(Integer, nullable=False)
-    currency = Column(String, default="INR")
-    product = relationship("Product")
-
-class Key(Base):
-    __tablename__ = "keys"
-    id = Column(Integer, primary_key=True)
-    product_id = Column(Integer, ForeignKey("products.id"))
-    key_value = Column(String, unique=True, nullable=False)
-    duration_days = Column(Integer, nullable=False)
-    assigned_to_user_id = Column(Integer, nullable=True)
-    assigned_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=True)
-    status = Column(SAEnum(KeyStatus), default=KeyStatus.unassigned)
-    product = relationship("Product")
-
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True)
-    tg_user_id = Column(Integer, nullable=False)
-    product_id = Column(Integer, ForeignKey("products.id"))
-    plan_id = Column(Integer, ForeignKey("plans.id"))
-    amount = Column(Integer, nullable=False)
-    currency = Column(String, default="INR")
-    status = Column(SAEnum(OrderStatus), default=OrderStatus.pending)
-    payment_ref = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    product = relationship("Product")
-    plan = relationship("Plan")
-
-Base.metadata.create_all(engine)
-
+# Price plans
 DEFAULT_PLANS = [1, 3, 7, 15, 30, 60]
-DEFAULT_PRICES = {1:120, 3:299, 7:499, 15:699, 30:999, 60:1499}
+DEFAULT_PRICES = {
+    1: 120,
+    3: 299,
+    7: 499,
+    15: 699,
+    30: 999,
+    60: 1499
+}
 
-# ========= HELPERS =========
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+# Products list
+PRODUCTS = [
+    "mars loader",
+    "kill loader",
+    "bgmi loader",
+    "bat loader"
+]
 
-async def ensure_user(update: Update):
-    with SessionLocal() as db:
-        u = db.get(User, update.effective_user.id)
-        if not u:
-            u = User(
-                tg_user_id=update.effective_user.id,
-                username=update.effective_user.username,
-                is_admin=is_admin(update.effective_user.id)
+# Product short names for commands
+PRODUCT_SHORT_NAMES = {
+    "mars": "mars loader",
+    "kill": "kill loader",
+    "bgmi": "bgmi loader",
+    "bat": "bat loader"
+}
+
+# UPI details
+UPI_ID = "xyz@upi"  # Replace with actual UPI ID
+
+# Conversation states
+SELECT_PRODUCT, SELECT_PLAN, PAYMENT_PROOF = range(3)
+
+# Database connection pool
+db_pool = None
+
+
+async def init_db_pool():
+    """Initialize the database connection pool and create tables if they don't exist."""
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        min_size=5,
+        max_size=20
+    )
+    
+    async with db_pool.acquire() as conn:
+        # Create keys table if it doesn't exist
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS keys (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                duration_days INT NOT NULL,
+                key_value STRING NOT NULL,
+                is_used BOOL DEFAULT FALSE,
+                added_at TIMESTAMP DEFAULT now()
             )
-            db.add(u)
-            db.commit()
-    return True
-
-def main_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 Products", callback_data="menu:products")],
-        [InlineKeyboardButton("📦 My Orders", callback_data="menu:orders")],
-        [InlineKeyboardButton("🛠️ Support", callback_data="menu:support")],
-    ])
-
-def admin_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏳ Pending Orders", callback_data="admin:orders:page:1")],
-        [InlineKeyboardButton("📦 Inventory", callback_data="admin:inventory")],
-        [InlineKeyboardButton("➕ Seed Products", callback_data="admin:seed")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="menu:home")],
-    ])
-
-def back_kb(to_cb: str):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=to_cb)]])
-
-# ========= HANDLERS =========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_user(update)
-    if update.message:
-        await update.message.reply_text("मुख्य मेन्यू:", reply_markup=main_menu_kb())
-    else:
-        await update.callback_query.edit_message_text("मुख्य मेन्यू:", reply_markup=main_menu_kb())
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
-    data = q.data
-
-    if data == "menu:home":
-        await q.edit_message_text("मुख्य मेन्यू:", reply_markup=main_menu_kb())
-        return
-
-    if data == "menu:products":
-        with SessionLocal() as db:
-            products = db.query(Product).all()
-        if not products:
-            await q.edit_message_text("Products उपलब्ध नहीं हैं. Admin पहले setup करे.", reply_markup=back_kb("menu:home"))
-            return
-        buttons = []
-        for p in products:
-            buttons.append([InlineKeyboardButton(p.name, callback_data=f"product:{p.id}")])
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:home")])
-        await q.edit_message_text("कृपया Product चुनें:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("product:"):
-        pid = int(data.split(":")[1])
-        with SessionLocal() as db:
-            plans = db.query(Plan).filter(Plan.product_id==pid).order_by(Plan.days).all()
-            p = db.get(Product, pid)
-        if not plans:
-            await q.edit_message_text("Plans सेट नहीं हैं.", reply_markup=back_kb("menu:products"))
-            return
-        buttons = []
-        for pl in plans:
-            label = f"{pl.days} दिन – ₹{pl.price_inr}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"plan:{pid}:{pl.id}")])
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:products")])
-        await q.edit_message_text(f"{p.name}\nअवधि/Plan चुनें:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if data.startswith("plan:"):
-        _, pid, plan_id = data.split(":")
-        pid = int(pid); plan_id = int(plan_id)
-        with SessionLocal() as db:
-            pl = db.get(Plan, plan_id)
-            if not pl:
-                await q.edit_message_text("Plan नहीं मिला.", reply_markup=back_kb(f"product:{pid}"))
-                return
-            # Create order
-            o = Order(
-                tg_user_id=uid, product_id=pid, plan_id=pl.id,
-                amount=pl.price_inr, currency=pl.currency,
-                status=OrderStatus.pending
+        """)
+        
+        # Check if product_name column exists in keys table
+        column_exists = await conn.fetchval(
+            """
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'keys' AND column_name = 'product_name'
+            """
+        )
+        
+        # Add product_name column if it doesn't exist
+        if not column_exists:
+            await conn.execute("""
+                ALTER TABLE keys ADD COLUMN product_name STRING NOT NULL DEFAULT 'bgmi loader'
+            """)
+            logger.info("Added product_name column to keys table")
+        
+        # Create orders table if it doesn't exist
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                user_id STRING NOT NULL,
+                username STRING,
+                duration_days INT NOT NULL,
+                amount DECIMAL NOT NULL,
+                status STRING DEFAULT 'pending', -- pending, approved, rejected
+                key_assigned STRING,
+                created_at TIMESTAMP DEFAULT now(),
+                approved_at TIMESTAMP
             )
-            db.add(o); db.commit()
-            o.payment_ref = f"O#{o.id}"
-            db.commit()
-
-        # Show Pay screen with QR + monospace UPI ID
-        pay_text = (
-            f"Order {o.payment_ref}\n"
-            f"Product: {pl.product.name}\n"
-            f"Plan: {pl.days} दिन\n"
-            f"Amount: ₹{pl.price_inr}\n\n"
-            f"कृपया नीचे दिए गए UPI QR से भुगतान करें.\n"
-            f"UPI ID: `{UPI_ID}`\n"
-            f"Note/Message में लिखें: `{o.payment_ref}`\n\n"
-            f"भुगतान के बाद नीचे वाला बटन दबाएँ."
+        """)
+        
+        # Check if product_name column exists in orders table
+        column_exists = await conn.fetchval(
+            """
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'orders' AND column_name = 'product_name'
+            """
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("मैंने भुगतान कर दिया ✅", callback_data=f"paid:{o.id}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data=f"product:{pid}")]
-        ])
-
-        # Send QR as new message with caption, then edit original
-        try:
-            await q.message.reply_photo(
-                photo=open(QR_PATH, "rb"),
-                caption=pay_text,
-                parse_mode="Markdown",
-                reply_markup=kb
+        
+        # Add product_name column if it doesn't exist
+        if not column_exists:
+            await conn.execute("""
+                ALTER TABLE orders ADD COLUMN product_name STRING NOT NULL DEFAULT 'bgmi loader'
+            """)
+            logger.info("Added product_name column to orders table")
+        
+        # Create sales_history table if it doesn't exist
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sales_history (
+                id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                user_id STRING NOT NULL,
+                username STRING,
+                duration_days INT NOT NULL,
+                amount DECIMAL NOT NULL,
+                key_given STRING,
+                created_at TIMESTAMP DEFAULT now()
             )
-            await q.edit_message_text("भुगतान निर्देश भेज दिए गए हैं।", reply_markup=back_kb(f"product:{pid}"))
-        except FileNotFoundError:
-            # Fallback if QR not found: just send text
-            await q.edit_message_text(pay_text, parse_mode="Markdown", reply_markup=kb)
-        return
-
-    if data.startswith("paid:"):
-        oid = int(data.split(":")[1])
-        with SessionLocal() as db:
-            o = db.get(Order, oid)
-            if not o or o.tg_user_id != uid:
-                await q.edit_message_text("Order नहीं मिला.", reply_markup=back_kb("menu:orders"))
-                return
-            if o.status in [OrderStatus.paid, OrderStatus.cancelled]:
-                await q.edit_message_text("यह order पहले ही process हो चुका है.", reply_markup=back_kb("menu:orders"))
-                return
-            o.status = OrderStatus.awaiting_approval
-            db.commit()
-            pl = db.get(Plan, o.plan_id)
-
-        await q.edit_message_text(f"{o.payment_ref} approval के लिए भेज दिया गया है. कृपया प्रतीक्षा करें.", reply_markup=back_kb("menu:home"))
-
-        # Notify both admins with Approve/Reject buttons
-        admin_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"admin:approve:{oid}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"admin:reject:{oid}")
-            ],
-            [InlineKeyboardButton("📄 Details", callback_data=f"admin:order:{oid}:detail")]
-        ])
-        notify_text = (
-            f"Pending Approval\n"
-            f"{o.payment_ref} | User: {o.tg_user_id}\n"
-            f"Plan: {pl.days} दिन | Amount: ₹{pl.price_inr}"
+        """)
+        
+        # Check if product_name column exists in sales_history table
+        column_exists = await conn.fetchval(
+            """
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'sales_history' AND column_name = 'product_name'
+            """
         )
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=notify_text, reply_markup=admin_kb)
-            except Exception:
-                pass
-        return
+        
+        # Add product_name column if it doesn't exist
+        if not column_exists:
+            await conn.execute("""
+                ALTER TABLE sales_history ADD COLUMN product_name STRING NOT NULL DEFAULT 'bgmi loader'
+            """)
+            logger.info("Added product_name column to sales_history table")
+        
+        logger.info("Database tables initialized successfully")
 
-    # ======= ADMIN SECTION =======
-    if data == "menu:orders":
-        # User orders list
-        with SessionLocal() as db:
-            orders = db.query(Order).filter(Order.tg_user_id==uid).order_by(Order.created_at.desc()).limit(10).all()
-        if not orders:
-            await q.edit_message_text("आपके कोई recent orders नहीं हैं.", reply_markup=back_kb("menu:home"))
-            return
-        lines = []
-        for o in orders:
-            lines.append(f"{o.payment_ref} | ₹{o.amount} | {o.status} | {o.created_at.strftime('%Y-%m-%d %H:%M')}")
-        await q.edit_message_text("Recent Orders:\n" + "\n".join(lines), reply_markup=back_kb("menu:home"))
-        return
 
-    if data == "menu:support":
-        txt = (
-            "सहायता चाहिए? यहाँ संपर्क करें:\n"
-            "- इस चैट में अपना प्रश्न लिखें.\n"
-            f"- भुगतान UPI: `{UPI_ID}`"
+async def get_available_keys_count(product: str, duration: int) -> int:
+    """Get available keys count for a specific product and duration."""
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM keys 
+            WHERE duration_days = $1 AND product_name = $2 AND is_used = FALSE
+            """,
+            duration, product
         )
-        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=back_kb("menu:home"))
-        return
+    return count
 
-    if data == "admin:inventory":
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        with SessionLocal() as db:
-            # Count unassigned keys by plan (days)
-            rows = db.execute(
-                "SELECT duration_days, COUNT(*) FROM keys WHERE status='unassigned' GROUP BY duration_days ORDER BY duration_days"
-            ).fetchall()
-        lines = ["Unassigned Keys:"]
-        if rows:
-            for d, cnt in rows:
-                lines.append(f"{d} दिन: {cnt}")
-        else:
-            lines.append("कोई keys नहीं मिलीं.")
-        await q.edit_message_text("\n".join(lines), reply_markup=admin_menu_kb())
-        return
 
-    if data == "admin:seed":
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        with SessionLocal() as db:
-            if not db.query(Product).first():
-                p = Product(name="Premium Access", description="Access to premium service via key.")
-                db.add(p); db.commit()
-                for d in DEFAULT_PLANS:
-                    db.add(Plan(product_id=p.id, days=d, price_inr=DEFAULT_PRICES[d]))
-                db.commit()
-                await q.edit_message_text("Default product & plans seeded.", reply_markup=admin_menu_kb())
-            else:
-                await q.edit_message_text("Products पहले से मौजूद हैं.", reply_markup=admin_menu_kb())
-        return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    
+    # Create inline keyboard with product options
+    keyboard = []
+    for i, product in enumerate(PRODUCTS, 1):
+        keyboard.append([InlineKeyboardButton(f"{i}️⃣ {product.title()}", callback_data=f"product_{product}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "👋 Welcome to BGMI Key Store 🔑\n\n"
+        "Please select a product:",
+        reply_markup=reply_markup
+    )
+    
+    return SELECT_PRODUCT
 
-    if data.startswith("admin:orders:page:"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        page = int(data.split(":")[-1])
-        page_size = 10
-        offset = (page-1)*page_size
-        with SessionLocal() as db:
-            orders = db.query(Order).order_by(Order.created_at.desc()).offset(offset).limit(page_size).all()
-        if not orders:
-            await q.edit_message_text("No orders.", reply_markup=admin_menu_kb())
-            return
-        lines = []
-        for o in orders:
-            lines.append(f"{o.payment_ref} | user:{o.tg_user_id} | ₹{o.amount} | {o.status}")
-        nav = []
-        if page > 1:
-            nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin:orders:page:{page-1}"))
-        nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"admin:orders:page:{page+1}"))
-        kb = InlineKeyboardMarkup([nav, [InlineKeyboardButton("⬅️ Back", callback_data="menu:home")]])
-        await q.edit_message_text("\n".join(lines), reply_markup=kb)
-        return
 
-    if data.startswith("admin:order:") and data.endswith(":detail"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        oid = int(data.split(":")[2])
-        with SessionLocal() as db:
-            o = db.get(Order, oid)
-            pl = db.get(Plan, o.plan_id) if o else None
-        if not o:
-            await q.edit_message_text("Order not found.", reply_markup=admin_menu_kb())
-            return
-        txt = (
-            f"{o.payment_ref}\n"
-            f"user: {o.tg_user_id}\n"
-            f"status: {o.status}\n"
-            f"amount: ₹{o.amount}\n"
-            f"plan: {pl.days if pl else '-'} दिन\n"
-            f"created: {o.created_at.strftime('%Y-%m-%d %H:%M')}"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Approve", callback_data=f"admin:approve:{oid}"),
-             InlineKeyboardButton("❌ Reject", callback_data=f"admin:reject:{oid}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:orders:page:1")]
-        ])
-        await q.edit_message_text(txt, reply_markup=kb)
-        return
+async def product_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle product selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract product name from callback data
+    product = query.data.split("_")[1]
+    
+    # Store selected product in context
+    context.user_data["selected_product"] = product
+    
+    # Get available keys count for each duration for this product
+    available_counts = {}
+    tasks = []
+    
+    for days in DEFAULT_PLANS:
+        task = asyncio.create_task(get_available_keys_count(product, days))
+        tasks.append((days, task))
+    
+    # Wait for all tasks to complete
+    for days, task in tasks:
+        available_counts[days] = await task
+    
+    # Create inline keyboard with plan options and available counts
+    keyboard = []
+    for i, days in enumerate(DEFAULT_PLANS, 1):
+        price = DEFAULT_PRICES[days]
+        count = available_counts[days]
+        status = "✅ Available" if count > 0 else "❌ Out of Stock"
+        keyboard.append([InlineKeyboardButton(
+            f"{i}️⃣ {days} Days - ₹{price} ({count} left) {status}", 
+            callback_data=f"plan_{days}" if count > 0 else "no_stock"
+        )])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🛒 You selected: {product.title()}\n\n"
+        "Choose your key duration:",
+        reply_markup=reply_markup
+    )
+    
+    return SELECT_PLAN
 
-    if data.startswith("admin:approve:"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        oid = int(data.split(":")[2])
-        with SessionLocal() as db:
-            o = db.get(Order, oid)
-            if not o:
-                await q.edit_message_text("Order not found.", reply_markup=admin_menu_kb()); return
-            if o.status == OrderStatus.paid:
-                await q.edit_message_text("Already approved.", reply_markup=admin_menu_kb()); return
-            if o.status == OrderStatus.cancelled:
-                await q.edit_message_text("Order cancelled.", reply_markup=admin_menu_kb()); return
 
-            # Assign key (matching product & duration)
-            pl = db.get(Plan, o.plan_id)
-            # row lock emulate with immediate assign in sqlite (best-effort)
-            k = db.query(Key).filter(
-                Key.product_id==o.product_id,
-                Key.duration_days==pl.days,
-                Key.status==KeyStatus.unassigned
-            ).first()
-            if not k:
-                await q.edit_message_text("No available key in inventory for this plan.", reply_markup=admin_menu_kb())
-                return
-            # mark and deliver
-            k.status = KeyStatus.assigned
-            k.assigned_to_user_id = o.tg_user_id
-            k.assigned_at = datetime.utcnow()
-            k.expires_at = k.assigned_at + timedelta(days=k.duration_days)
-            o.status = OrderStatus.paid
-            db.commit()
-
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=o.tg_user_id,
-                    text=(
-                        f"आपका {o.payment_ref} approve हुआ.\n"
-                        f"Key: {k.key_value}\n"
-                        f"Valid till: {k.expires_at.date()}"
-                    )
-                )
-            except Exception:
-                pass
-
-        await q.edit_message_text(f"Order {oid} approved and key delivered.", reply_markup=admin_menu_kb())
-        return
-
-    if data.startswith("admin:reject:"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        oid = int(data.split(":")[2])
-        # Show predefined reasons
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("No payment found", callback_data=f"admin:reject_reason:{oid}:no_payment")],
-            [InlineKeyboardButton("Wrong amount", callback_data=f"admin:reject_reason:{oid}:wrong_amount")],
-            [InlineKeyboardButton("Invalid proof", callback_data=f"admin:reject_reason:{oid}:invalid_proof")],
-            [InlineKeyboardButton("Timeout", callback_data=f"admin:reject_reason:{oid}:timeout")],
-            [InlineKeyboardButton("Other (custom)", callback_data=f"admin:reject_custom:{oid}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="admin:orders:page:1")]
-        ])
-        await q.edit_message_text(f"Reject Order {oid}: reason चुनें", reply_markup=kb)
-        return
-
-    if data.startswith("admin:reject_reason:"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        _, _, oid, reason_code = data.split(":")
-        oid = int(oid)
-        reasons_map = {
-            "no_payment": "No payment found",
-            "wrong_amount": "Wrong amount",
-            "invalid_proof": "Invalid proof",
-            "timeout": "Timeout",
-        }
-        reason = reasons_map.get(reason_code, "Rejected")
-        with SessionLocal() as db:
-            o = db.get(Order, oid)
-            if not o:
-                await q.edit_message_text("Order not found.", reply_markup=admin_menu_kb()); return
-            if o.status in [OrderStatus.paid, OrderStatus.cancelled]:
-                await q.edit_message_text("Order already processed.", reply_markup=admin_menu_kb()); return
-            o.status = OrderStatus.cancelled
-            db.commit()
-        try:
-            await context.bot.send_message(chat_id=o.tg_user_id, text=f"आपका {o.payment_ref} reject किया गया: {reason}")
-        except Exception:
-            pass
-        await q.edit_message_text(f"Order {oid} rejected: {reason}", reply_markup=admin_menu_kb())
-        return
-
-    if data.startswith("admin:reject_custom:"):
-        if not is_admin(uid):
-            await q.edit_message_text("Unauthorized.", reply_markup=back_kb("menu:home"))
-            return
-        oid = int(data.split(":")[2])
-        # Put admin into "expecting custom reason" state via user_data
-        context.user_data["awaiting_custom_reject_for"] = oid
-        await q.edit_message_text(f"Order {oid} reject reason टाइप करें (एक संदेश में).", reply_markup=back_kb("admin:orders:page:1"))
-        return
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle custom reject reason typed by admin
-    uid = update.effective_user.id
-    if context.user_data.get("awaiting_custom_reject_for") and is_admin(uid):
-        oid = context.user_data.pop("awaiting_custom_reject_for")
-        reason = update.message.text.strip()[:300]
-        with SessionLocal() as db:
-            o = db.get(Order, oid)
-            if not o:
-                await update.message.reply_text("Order not found."); return
-            if o.status in [OrderStatus.paid, OrderStatus.cancelled]:
-                await update.message.reply_text("Order already processed."); return
-            o.status = OrderStatus.cancelled
-            db.commit()
-        try:
-            await update.message.reply_text(f"Order {oid} rejected: {reason}")
-            await update.get_bot().send_message(chat_id=o.tg_user_id, text=f"आपका {o.payment_ref} reject किया गया: {reason}")
-        except Exception:
-            pass
-        return
-
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # open admin menu by command
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Unauthorized.")
-        return
-    await update.message.reply_text("Admin Menu:", reply_markup=admin_menu_kb())
-
-async def seed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Unauthorized.")
-        return
-    with SessionLocal() as db:
-        if not db.query(Product).first():
-            p = Product(name="Premium Access", description="Access to premium service via key.")
-            db.add(p); db.commit()
-            for d in DEFAULT_PLANS:
-                db.add(Plan(product_id=p.id, days=d, price_inr=DEFAULT_PRICES[d], currency="INR"))
-            db.commit()
-            await update.message.reply_text("Default product & plans seeded.")
-        else:
-            await update.message.reply_text("Products पहले से मौजूद हैं.")
-
-async def add_key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /add_key <product_id> <days> <key_value>
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Unauthorized.")
-        return
+async def plan_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle plan selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract plan duration from callback data
+    if query.data == "no_stock":
+        await query.answer("This plan is currently out of stock.", show_alert=True)
+        return SELECT_PLAN
+    
+    duration = int(query.data.split("_")[1])
+    price = DEFAULT_PRICES[duration]
+    product = context.user_data.get("selected_product")
+    
+    # Check if keys are available for this product and duration
+    available_count = await get_available_keys_count(product, duration)
+    
+    if available_count == 0:
+        await query.answer("This plan is currently out of stock.", show_alert=True)
+        return SELECT_PLAN
+    
+    # Store selected plan in context
+    context.user_data["selected_plan"] = duration
+    context.user_data["price"] = price
+    
+    # Send payment details
+    await query.edit_message_text(
+        f"🛒 You selected: {product.title()} - {duration} Days Key\n\n"
+        f"💰 Price: ₹{price}\n\n"
+        f"⚡ Pay via UPI: {UPI_ID}\n\n"
+        f"📷 Scan QR below:"
+    )
+    
+    # Send QR code image
     try:
-        _, product_id, days, key_value = update.message.text.split(" ", 3)
-        product_id = int(product_id); days = int(days)
-    except Exception:
-        await update.message.reply_text("Usage: /add_key <product_id> <days> <key_value>")
+        with open("qr.png", "rb") as qr_file:
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=InputFile(qr_file)
+            )
+    except Exception as e:
+        logger.error(f"Error sending QR code: {e}")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⚠️ Error loading QR code. Please proceed with the UPI payment."
+        )
+    
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="✅ After payment, send your screenshot or transaction ID here."
+    )
+    
+    return PAYMENT_PROOF
+
+
+async def payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle payment proof submission."""
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.username or user.first_name
+    
+    product = context.user_data.get("selected_product")
+    duration = context.user_data.get("selected_plan")
+    price = context.user_data.get("price")
+    
+    if not product or not duration or not price:
+        await update.message.reply_text("⚠️ Session expired. Please start again with /start")
+        return ConversationHandler.END
+    
+    # Create order in database
+    order_id = str(uuid.uuid4())
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO orders (id, user_id, username, product_name, duration_days, amount, status)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+            """,
+            order_id, user_id, username, product, duration, price
+        )
+    
+    # Forward payment proof to admins
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{order_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{order_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Forward the message (photo or text) to all admins
+    for admin_id in ADMIN_IDS:
+        try:
+            if update.message.photo:
+                # Forward photo
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=update.message.photo[-1].file_id,
+                    caption=(
+                        f"🆕 New Order Request\n\n"
+                        f"User: @{username} (id: {user_id})\n"
+                        f"Product: {product.title()}\n"
+                        f"Plan: {duration} Days\n"
+                        f"Amount: ₹{price}\n"
+                        f"Status: Pending\n"
+                        f"Order ID: {order_id}"
+                    ),
+                    reply_markup=reply_markup
+                )
+            else:
+                # Forward text
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"🆕 New Order Request\n\n"
+                        f"User: @{username} (id: {user_id})\n"
+                        f"Product: {product.title()}\n"
+                        f"Plan: {duration} Days\n"
+                        f"Amount: ₹{price}\n"
+                        f"Status: Pending\n"
+                        f"Transaction ID: {update.message.text}\n"
+                        f"Order ID: {order_id}"
+                    ),
+                    reply_markup=reply_markup
+                )
+        except Exception as e:
+            logger.error(f"Error forwarding message to admin {admin_id}: {e}")
+    
+    await update.message.reply_text(
+        "✅ Your payment proof has been submitted. Please wait for admin verification."
+    )
+    
+    # Clear user data
+    context.user_data.clear()
+    
+    return ConversationHandler.END
+
+
+async def approve_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle order approval."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Check if user is admin
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("⚠️ You are not authorized to perform this action.")
         return
-    with SessionLocal() as db:
-        db.add(Key(product_id=product_id, key_value=key_value, duration_days=days))
-        db.commit()
-    await update.message.reply_text("Key added.")
+    
+    # Extract order ID from callback data
+    order_id = query.data.split("_")[1]
+    
+    async with db_pool.acquire() as conn:
+        # Get order details
+        order = await conn.fetchrow(
+            "SELECT * FROM orders WHERE id = $1", order_id
+        )
+        
+        if not order:
+            await query.edit_message_text("⚠️ Order not found.")
+            return
+        
+        if order["status"] != "pending":
+            await query.edit_message_text(f"⚠️ This order is already {order['status']}.")
+            return
+        
+        # Get an unused key for the selected duration and product
+        key_record = await conn.fetchrow(
+            """
+            SELECT * FROM keys 
+            WHERE duration_days = $1 AND product_name = $2 AND is_used = FALSE 
+            LIMIT 1
+            """,
+            order["duration_days"], order["product_name"]
+        )
+        
+        if not key_record:
+            # No keys available
+            await query.edit_message_text(
+                f"⚠️ No keys available for {order['product_name']} - {order['duration_days']} days plan."
+            )
+            
+            # Notify user
+            await context.bot.send_message(
+                chat_id=int(order["user_id"]),
+                text="⚠️ Sorry, no keys available for your selected plan right now. Please contact support."
+            )
+            return
+        
+        # Update order status and assign key
+        await conn.execute(
+            """
+            UPDATE orders 
+            SET status = 'approved', key_assigned = $1, approved_at = now()
+            WHERE id = $2
+            """,
+            key_record["key_value"], order_id
+        )
+        
+        # Mark key as used
+        await conn.execute(
+            "UPDATE keys SET is_used = TRUE WHERE id = $1",
+            key_record["id"]
+        )
+        
+        # Add to sales history
+        await conn.execute(
+            """
+            INSERT INTO sales_history (user_id, username, product_name, duration_days, amount, key_given)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            order["user_id"], order["username"], order["product_name"], 
+            order["duration_days"], order["amount"], key_record["key_value"]
+        )
+    
+    # Calculate expiry date
+    expiry_date = datetime.now() + timedelta(days=order["duration_days"])
+    expiry_str = expiry_date.strftime("%Y-%m-%d")
+    
+    # Send key to user
+    await context.bot.send_message(
+        chat_id=int(order["user_id"]),
+        text=(
+            f"✅ Payment Verified!\n\n"
+            f"Here is your {order['product_name'].title()} - {order['duration_days']} Days Key:\n\n"
+            f"👉 {key_record['key_value']}\n\n"
+            f"📅 Expiry: {expiry_str}"
+        )
+    )
+    
+    # Update admin message
+    await query.edit_message_text(
+        f"✅ Order Approved!\n\n"
+        f"User: @{order['username']} (id: {order['user_id']})\n"
+        f"Product: {order['product_name'].title()}\n"
+        f"Plan: {order['duration_days']} Days\n"
+        f"Amount: ₹{order['amount']}\n"
+        f"Key Assigned: {key_record['key_value']}"
+    )
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_user(update)
-    await update.message.reply_text("मुख्य मेन्यू:", reply_markup=main_menu_kb())
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("seed_products", seed_cmd))
-    app.add_handler(CommandHandler("add_key", add_key_cmd))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    print("Bot running...")
-    app.run_polling()
+async def reject_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle order rejection."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Check if user is admin
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("⚠️ You are not authorized to perform this action.")
+        return
+    
+    # Extract order ID from callback data
+    order_id = query.data.split("_")[1]
+    
+    async with db_pool.acquire() as conn:
+        # Get order details
+        order = await conn.fetchrow(
+            "SELECT * FROM orders WHERE id = $1", order_id
+        )
+        
+        if not order:
+            await query.edit_message_text("⚠️ Order not found.")
+            return
+        
+        if order["status"] != "pending":
+            await query.edit_message_text(f"⚠️ This order is already {order['status']}.")
+            return
+        
+        # Update order status
+        await conn.execute(
+            "UPDATE orders SET status = 'rejected' WHERE id = $1",
+            order_id
+        )
+    
+    # Notify user
+    await context.bot.send_message(
+        chat_id=int(order["user_id"]),
+        text="❌ Payment not verified. Please try again or contact support."
+    )
+    
+    # Update admin message
+    await query.edit_message_text(
+        f"❌ Order Rejected!\n\n"
+        f"User: @{order['username']} (id: {order['user_id']})\n"
+        f"Product: {order['product_name'].title()}\n"
+        f"Plan: {order['duration_days']} Days\n"
+        f"Amount: ₹{order['amount']}"
+    )
+
+
+async def add_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a new key to the database."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+        return
+    
+    if len(context.args) != 3:
+        await update.message.reply_text("Usage: /add_key <days> <key> <product>\n\nAvailable products: mars, kill, bgmi, bat")
+        return
+    
+    try:
+        days = int(context.args[0])
+        key = context.args[1]
+        product_short = context.args[2].lower()
+        
+        # Validate duration
+        if days not in DEFAULT_PLANS:
+            await update.message.reply_text(f"⚠️ Invalid duration. Valid options: {', '.join(map(str, DEFAULT_PLANS))}")
+            return
+        
+        # Validate product
+        if product_short not in PRODUCT_SHORT_NAMES:
+            await update.message.reply_text(f"⚠️ Invalid product. Valid options: {', '.join(PRODUCT_SHORT_NAMES.keys())}")
+            return
+        
+        product_name = PRODUCT_SHORT_NAMES[product_short]
+        
+        async with db_pool.acquire() as conn:
+            # Check if key already exists
+            existing_key = await conn.fetchrow(
+                "SELECT * FROM keys WHERE key_value = $1", key
+            )
+            
+            if existing_key:
+                await update.message.reply_text("⚠️ This key already exists in the database.")
+                return
+            
+            # Add the key
+            await conn.execute(
+                "INSERT INTO keys (duration_days, key_value, product_name) VALUES ($1, $2, $3)",
+                days, key, product_name
+            )
+        
+        await update.message.reply_text(f"✅ Key added successfully for {product_name.title()} - {days} days plan.")
+    
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid duration. Please provide a valid number.")
+    except Exception as e:
+        logger.error(f"Error adding key: {e}")
+        await update.message.reply_text("⚠️ An error occurred while adding the key.")
+
+
+async def list_keys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List available keys count per duration and product."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+        return
+    
+    message = "🔑 Available Keys:\n\n"
+    
+    # Get all key counts concurrently
+    tasks = []
+    for product in PRODUCTS:
+        for days in DEFAULT_PLANS:
+            task = asyncio.create_task(get_available_keys_count(product, days))
+            tasks.append((product, days, task))
+    
+    # Wait for all tasks to complete
+    key_counts = {}
+    for product, days, task in tasks:
+        try:
+            key_counts[(product, days)] = await task
+        except Exception as e:
+            logger.error(f"Error getting key count for {product} {days} days: {e}")
+            key_counts[(product, days)] = 0
+    
+    # Build the message
+    for product in PRODUCTS:
+        message += f"📦 {product.title()}:\n"
+        for days in DEFAULT_PLANS:
+            count = key_counts[(product, days)]
+            status = "✅" if count > 0 else "❌"
+            message += f"  {status} {days} Days: {count} keys\n"
+        message += "\n"
+    
+    await update.message.reply_text(message)
+
+
+async def remove_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a key from the database."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+        return
+    
+    if len(context.args) != 3:
+        await update.message.reply_text("Usage: /remove_key <days> <key> <product>\n\nAvailable products: mars, kill, bgmi, bat")
+        return
+    
+    try:
+        days = int(context.args[0])
+        key = context.args[1]
+        product_short = context.args[2].lower()
+        
+        # Validate product
+        if product_short not in PRODUCT_SHORT_NAMES:
+            await update.message.reply_text(f"⚠️ Invalid product. Valid options: {', '.join(PRODUCT_SHORT_NAMES.keys())}")
+            return
+        
+        product_name = PRODUCT_SHORT_NAMES[product_short]
+        
+        async with db_pool.acquire() as conn:
+            # Check if key exists and is unused
+            key_record = await conn.fetchrow(
+                """
+                SELECT * FROM keys 
+                WHERE duration_days = $1 AND key_value = $2 AND product_name = $3 AND is_used = FALSE
+                """,
+                days, key, product_name
+            )
+            
+            if not key_record:
+                await update.message.reply_text("⚠️ Key not found or already used.")
+                return
+            
+            # Remove the key
+            await conn.execute(
+                "DELETE FROM keys WHERE id = $1",
+                key_record["id"]
+            )
+        
+        await update.message.reply_text(f"✅ Key removed successfully from {product_name.title()} - {days} days plan.")
+    
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid duration. Please provide a valid number.")
+    except Exception as e:
+        logger.error(f"Error removing key: {e}")
+        await update.message.reply_text("⚠️ An error occurred while removing the key.")
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show last 10 sales with details."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+        return
+    
+    message = "📊 Recent Sales History:\n\n"
+    
+    async with db_pool.acquire() as conn:
+        # Get last 10 sales
+        sales = await conn.fetch(
+            """
+            SELECT * FROM sales_history 
+            ORDER BY created_at DESC 
+            LIMIT 10
+            """
+        )
+        
+        if not sales:
+            message += "No sales history available."
+        else:
+            for sale in sales:
+                created_at = sale["created_at"].strftime("%Y-%m-%d %H:%M")
+                message += (
+                    f"📅 {created_at}\n"
+                    f"👤 User: @{sale['username']} (ID: {sale['user_id']})\n"
+                    f"🛒 Product: {sale['product_name'].title()}\n"
+                    f"🔑 Plan: {sale['duration_days']} Days\n"
+                    f"💰 Amount: ₹{sale['amount']}\n"
+                    f"🔑 Key: {sale['key_given']}\n\n"
+                )
+    
+    await update.message.reply_text(message)
+
+
+async def export_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export full sales history as CSV."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ You are not authorized to use this command.")
+        return
+    
+    try:
+        import csv
+        import io
+        
+        # Create CSV file in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        writer.writerow([
+            "Date", "User ID", "Username", "Product", "Duration (Days)", 
+            "Amount", "Key Given"
+        ])
+        
+        async with db_pool.acquire() as conn:
+            # Get all sales
+            sales = await conn.fetch(
+                """
+                SELECT * FROM sales_history 
+                ORDER BY created_at DESC
+                """
+            )
+            
+            # Write data
+            for sale in sales:
+                created_at = sale["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                writer.writerow([
+                    created_at, sale["user_id"], sale["username"],
+                    sale["product_name"], sale["duration_days"], 
+                    sale["amount"], sale["key_given"]
+                ])
+        
+        # Reset file pointer
+        output.seek(0)
+        
+        # Send CSV file
+        await update.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=InputFile(
+                file=output.getvalue().encode(),
+                filename="sales_history.csv"
+            ),
+            caption="📊 Sales History Export"
+        )
+    
+    except Exception as e:
+        logger.error(f"Error exporting history: {e}")
+        await update.message.reply_text("⚠️ An error occurred while exporting the sales history.")
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the conversation."""
+    await update.message.reply_text("Operation cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def main() -> None:
+    """Start the bot."""
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Initialize database
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db_pool())
+
+    # Add conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            SELECT_PRODUCT: [CallbackQueryHandler(product_selected, pattern="^product_")],
+            SELECT_PLAN: [CallbackQueryHandler(plan_selected, pattern="^plan_")],
+            PAYMENT_PROOF: [MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, payment_proof)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    application.add_handler(conv_handler)
+
+    # Admin commands
+    application.add_handler(CommandHandler("add_key", add_key))
+    application.add_handler(CommandHandler("list_keys", list_keys))
+    application.add_handler(CommandHandler("remove_key", remove_key))
+    application.add_handler(CommandHandler("history", history))
+    application.add_handler(CommandHandler("export_history", export_history))
+
+    # Admin approval/rejection callbacks
+    application.add_handler(CallbackQueryHandler(approve_order, pattern="^approve_"))
+    application.add_handler(CallbackQueryHandler(reject_order, pattern="^reject_"))
+
+    # Run the bot until the user presses Ctrl-C
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
