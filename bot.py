@@ -54,7 +54,7 @@ SELECT_PRODUCT, SELECT_PLAN, PAYMENT_PROOF = range(3)
 ADMIN_ADD_PRODUCT_NAME = 100
 
 # UPI details
-UPI_ID = os.getenv("UPI_ID", "xyz@upi")  # Replace with actual UPI ID
+UPI_ID = os.getenv("UPI_ID", "ninjagamerop0786@ybl")  # Replace with actual UPI ID
 
 # Database connection pool
 db_pool: Optional[asyncpg.Pool] = None
@@ -304,7 +304,7 @@ async def plan_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
 
     try:
-        with open("qr.png", "rb") as qr_file:
+        with open("qr.jpg", "rb") as qr_file:
             await context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=InputFile(qr_file),
