@@ -1,0 +1,39 @@
+name: Run Telegram Bot
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'bot.py'
+      - '.github/workflows/bot.yml'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir python-telegram-bot asyncpg python-dotenv
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          UPI_ID: ${{ secrets.UPI_ID }}
+        run: python bot.py
