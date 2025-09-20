@@ -3,7 +3,7 @@ name: Run Soul 50x
 on:
   push:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/30 * * * *'
 
 jobs:
   pannel:
