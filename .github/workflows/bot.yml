@@ -4,6 +4,10 @@ on:
   push:
   schedule:
     - cron: '*/30 * * * *'
+    
+concurrency:   
+  group: mybot-workflow-group
+  cancel-in-progress: true
 
 jobs:
   pannel:
