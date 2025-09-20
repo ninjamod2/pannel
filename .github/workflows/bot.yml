@@ -26,20 +26,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir python-telegram-bot asyncpg python-dotenv
 
-      - name: Preflight: verify secrets exist
+      - name: Preflight: verify required secrets
         run: |
-          [[ -z "${{ secrets.BOT_TOKEN }}" ]] && echo "Missing BOT_TOKEN" && exit 1
-          [[ -z "${{ secrets.DB_HOST }}" ]] && echo "Missing DB_HOST" && exit 1
-          echo "Secrets present"
-      
+          check() { [ -z "$1" ] && echo "Missing $2" && exit 1 || echo "OK: $2 present"; }
+          check "${{ secrets.BOT_TOKEN }}" BOT_TOKEN
+          check "${{ secrets.DB_HOST }}"   DB_HOST
+          check "${{ secrets.DB_USER }}"   DB_USER
+          check "${{ secrets.DB_PASS }}"   DB_PASS
+          check "${{ secrets.DB_NAME }}"   DB_NAME
+          echo "Optional: DB_PORT=${{ secrets.DB_PORT != '' && 'set' || 'default(26257)' }}"
+          echo "Optional: ADMIN_IDS=${{ secrets.ADMIN_IDS != '' && 'set' || 'default in code' }}"
+          echo "Optional: UPI_ID=${{ secrets.UPI_ID != '' && 'set' || 'default in code' }}"
+
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_PORT: ${{ secrets.DB_PORT }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASS: ${{ secrets.DB_PASS }}
-          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_HOST:   ${{ secrets.DB_HOST }}
+          DB_PORT:   ${{ secrets.DB_PORT }}
+          DB_USER:   ${{ secrets.DB_USER }}
+          DB_PASS:   ${{ secrets.DB_PASS }}
+          DB_NAME:   ${{ secrets.DB_NAME }}
           ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
-          UPI_ID: ${{ secrets.UPI_ID }}
+          UPI_ID:    ${{ secrets.UPI_ID }}
         run: python bot.py
