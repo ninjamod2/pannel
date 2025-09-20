@@ -26,6 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir python-telegram-bot asyncpg python-dotenv
 
+      - name: Preflight: verify secrets exist
+        run: |
+          [[ -z "${{ secrets.BOT_TOKEN }}" ]] && echo "Missing BOT_TOKEN" && exit 1
+          [[ -z "${{ secrets.DB_HOST }}" ]] && echo "Missing DB_HOST" && exit 1
+          echo "Secrets present"
+      
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
