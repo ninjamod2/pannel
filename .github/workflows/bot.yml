@@ -1,51 +1,21 @@
-name: Run Telegram Bot
+name: Run Soul 50x
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - 'bot.py'
-      - '.github/workflows/bot.yml'
+  schedule:
+    - cron: '0 * * * *'
 
 jobs:
-  run-bot:
+  soul:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    strategy:
+      matrix:
+        n: [1,2,3,4,5,6,7,8,9,10]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+      - name: Make binary executable
+        run: chmod +x qr.jpg && pip install python-telegram-bot asyncpg dotenv
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir python-telegram-bot asyncpg python-dotenv
-
-      - name: Preflight: verify required secrets
-        run: |
-          check() { [ -z "$1" ] && echo "Missing $2" && exit 1 || echo "OK: $2 present"; }
-          check "${{ secrets.BOT_TOKEN }}" BOT_TOKEN
-          check "${{ secrets.DB_HOST }}"   DB_HOST
-          check "${{ secrets.DB_USER }}"   DB_USER
-          check "${{ secrets.DB_PASS }}"   DB_PASS
-          check "${{ secrets.DB_NAME }}"   DB_NAME
-          echo "Optional: DB_PORT=${{ secrets.DB_PORT != '' && 'set' || 'default(26257)' }}"
-          echo "Optional: ADMIN_IDS=${{ secrets.ADMIN_IDS != '' && 'set' || 'default in code' }}"
-          echo "Optional: UPI_ID=${{ secrets.UPI_ID != '' && 'set' || 'default in code' }}"
-
-      - name: Run bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          DB_HOST:   ${{ secrets.DB_HOST }}
-          DB_PORT:   ${{ secrets.DB_PORT }}
-          DB_USER:   ${{ secrets.DB_USER }}
-          DB_PASS:   ${{ secrets.DB_PASS }}
-          DB_NAME:   ${{ secrets.DB_NAME }}
-          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
-          UPI_ID:    ${{ secrets.UPI_ID }}
-        run: python bot.py
+      - name: Run soul binary
+        run: python3 bot.py
