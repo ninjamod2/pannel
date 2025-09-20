@@ -5,7 +5,7 @@ on:
   push:
     paths:
       - 'bot.py'
-      - '.github/workflows/bot.yml'
+      - '.github/workflows/main.yml'
 
 jobs:
   run-bot:
